@@ -1,0 +1,289 @@
+---
+title: "BCB420_A1"
+output:
+  html_document:
+    df_print: paged
+---
+# Library Preperation
+
+We will start by checking if the required libraries and files are installed.
+Then we will load the libraries using library().
+```{r message=FALSE, warning=TRUE}
+if (!requireNamespace("BiocManager", quietly = TRUE)){
+  install.packages("BiocManager")
+}
+if (!requireNamespace("GEOmetadb", quietly = TRUE)){
+  BiocManager::install("GEOmetadb")
+}
+
+if (!file.exists('GEOmetadb.sqlite')){
+  getSQLiteFile()
+}
+
+if (!requireNamespace("biomaRt", quietly = TRUE)){
+  BiocManager::install("biomaRt")
+}
+
+if (!requireNamespace("edgeR", quietly = TRUE)){
+  BiocManager::install("edgeR")
+}
+
+library(BiocManager)
+library(edgeR)
+library(GEOmetadb)
+library(biomaRt)
+library(knitr)
+```
+
+# Data Selection
+
+Now with all libraries installed, we will use the following commands to query the GEOmetadb (GEO database) to look for a dataset with a "raw counts" txt-supplmentary file. Note we are specifically querying datasets with submission dates > 2015-01-01, related to cancer and high throughput sequencing data of Homo sapiens. 
+```{r}
+sql <- paste("SELECT DISTINCT gse.title,gse.gse, gpl.title,",
+             " gse.submission_date,",
+             " gse.supplementary_file",
+             "FROM",
+             "  gse JOIN gse_gpl ON gse_gpl.gse=gse.gse",
+             "  JOIN gpl ON gse_gpl.gpl=gpl.gpl",
+             "WHERE",
+             "  gse.submission_date > '2015-01-01' AND",
+             "  gse.title LIKE '%cancer%' AND", 
+             "  gpl.organism LIKE '%Homo sapiens%' AND",
+             "  gpl.technology LIKE '%high-throughput seq%' ",
+             "  ORDER BY gse.submission_date DESC",sep=" ")
+con <- dbConnect(SQLite(), 'GEOmetadb.sqlite')
+rs <- dbGetQuery(con, sql)
+unlist(lapply(rs$supplementary_file,
+              FUN = function(x){x <- unlist(strsplit(x,";")) ;
+              x <- x[grep(x,pattern="txt",ignore.case = TRUE)];
+              tail(unlist(strsplit(x,"/")),n=1)})) [1:30]
+```
+
+The chosen dataset is "GSE164531" which is an RNA-seq dataset using the Illumina Hiseq 2000 platform for identification of NEDD9 regulated genes in VCaP prosatate cancer cells. We download the counts data using the following commands and check the dimensions of the data.
+```{r include=FALSE}
+sfiles <- getGEOSuppFiles('GSE164531')
+fnames <- rownames(sfiles)
+```
+
+We then load the counts data into R and check the dimentions.
+```{r}
+data <- read.delim(fnames[1], header = TRUE, check.names = FALSE)
+dim(data)
+```
+
+Then we quickly check the head of the data (first 10 rows) to explore further.
+```{r}
+head(data)
+```
+
+# Initial Exploratory Analysis
+
+### Duplicate Genes
+
+The first exploratory analysis is checking for duplicate genes in our data. We run the following commands and find that there are no duplicate genes present in the data. Resulting in no further actions required to deal with duplicate genes.
+
+```{r message=FALSE}
+summarized_gene_counts <- sort(table(data$EnsemblID),decreasing = TRUE)
+kable(summarized_gene_counts[which(summarized_gene_counts > 1)[1:10]], format = 'html')
+```
+
+### Missing Data
+
+Now we check for any missing data in the dataset. 
+
+```{r}
+# Check which rows have missing data
+which(!complete.cases(data))
+```
+
+We see that row 58736 has missing data, we access this row to explore further.
+
+```{r}
+data[58736,]
+```
+Seems like this row is just an empty row with no meaningful data. As it contains no data, we can safely remove the row without affecting the data-set (We remove the row as it N/A values may interfere with next steps such as normalization).
+```{r}
+data <- data[complete.cases(data),]
+dim(data)
+```
+
+### Grouping the Data
+We will define groups for the data according to each biological condition (experiment design) for later steps such as normalization.
+```{r}
+samples <- data.frame(lapply(colnames(data)[3:8], FUN=function(x){unlist(strsplit(x, split = "_"))[c(1)]}))
+colnames(samples) <- colnames(data)[3:8]
+rownames(samples) <- c("condition")
+samples <- data.frame(t(samples))
+samples
+```
+
+# Filtering Data
+We now filter out low counts from the data according to the edgeR protocol. The threshold is set to 3 because edgeR recommends the threshold to be the number of replications which in our data set is 3 (Would be interesting to see what happens if we change our threshold, but we will keep it to 3 for now).
+```{r}
+cpms <- edgeR::cpm(data[, 3:8])
+rownames(cpms) <- data[, 1]
+# Threshold set to 3 as recommended by edgeR protocol
+keep <- rowSums(cpms > 1) >= 3
+dataFiltered <- data[keep, ]
+head(dataFiltered)
+```
+
+We quickly compare the dimensions of the filtered data and original data.
+```{r}
+dim(data)
+```
+
+```{r}
+dim(dataFiltered)
+```
+We notice that the total number of genes reduced to 14682 from 58735 after filtering out low expression data using the edgeR filtering protocol.
+
+
+# Mapping Data
+
+Now we will map the filtered data to HUGO gene symbols using grch38.p13 and the biomaRt package. The following commands creates a ensembl_gene_id and HUGO gene symbol conversion table which we will use to merge with the expression data after normalization.
+```{r}
+ensembl <- useMart("ensembl")
+ensembl <- useDataset("hsapiens_gene_ensembl",mart=ensembl)
+conversionStash <- "data_conversion.rds"
+if(file.exists(conversionStash)){
+  dataIdConversion <- readRDS(conversionStash)
+} else {
+  dataIdConversion <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                               filters = c("ensembl_gene_id"),
+                               values = dataFiltered$EnsemblID,
+                               mart = ensembl)
+  saveRDS(dataIdConversion, conversionStash)
+}
+
+dataIdConversion
+```
+
+# Normalization
+
+We will now normalize our data using the TMM method using the following commands.
+```{r}
+filteredDataMatrix <- as.matrix(dataFiltered[,3:8])
+rownames(filteredDataMatrix) <- dataFiltered$EnsemblID
+d = DGEList(counts = filteredDataMatrix, group = samples$condition)
+d = calcNormFactors(d)
+normalizedCounts <- cpm(d)
+```
+
+Now we will merge the normalizedCounts with our identifiers that we mapped in our previous step. Now we have a dataFrame with mapped ensembl_gene_id, HUGO gene symbols and normalized expression data.
+
+```{r}
+dataFilteredAnnot <- merge(dataIdConversion, normalizedCounts, by.x = 1, by.y = 0, all.y=TRUE)
+kable(dataFilteredAnnot[1:5,1:8],type = "html")
+```
+
+
+### Pre-normalization Density vs Post-normalization Density
+The density plots for pre-normalization and post-normalization data is plotted for comparison.
+
+#### Pre-normalization:
+```{r}
+pre_data2plot <- log2(cpm(dataFiltered[, 3:8]))
+pre_counts_density <- apply(log2(cpm(dataFiltered[, 3:8])), 2, density)
+xlim <- 0
+ylim <- 0
+for (i in 1:length(pre_counts_density)) {
+  xlim <- range(c(xlim, pre_counts_density[[i]]$x)); 
+  ylim <- range(c(ylim, pre_counts_density[[i]]$y))
+  }
+cols <- rainbow(length(pre_counts_density))
+ltys <- rep(1, length(pre_counts_density))
+#plot the first density plot to initialize the plot
+plot(pre_counts_density[[1]], xlim=xlim, ylim=ylim, type="n", ylab="Smoothing density of log2-CPM", main="", cex.lab = 0.85)
+#plot each line
+for (i in 1:length(pre_counts_density)) lines(pre_counts_density[[i]], col=cols[i], lty=ltys[i])
+#create legend
+legend("topright", colnames(pre_data2plot),  
+       col=cols, lty=ltys, cex=0.75,
+       border ="blue",  text.col = "green4",
+       merge = TRUE, bg = "gray90")
+```
+
+#### Post-normalization:
+```{r}
+post_data2plot <- log2(cpm(dataFilteredAnnot[, 3:8]))
+post_counts_density <- apply(log2(cpm(dataFilteredAnnot[, 3:8])), 2, density)
+xlim <- 0
+ylim <- 0
+for (i in 1:length(post_counts_density)) {
+  xlim <- range(c(xlim, post_counts_density[[i]]$x)) 
+  ylim <- range(c(ylim, post_counts_density[[i]]$y))
+  }
+cols <- rainbow(length(post_counts_density))
+ltys <- rep(1, length(post_counts_density))
+#plot the first density plot to initialize the plot
+plot(post_counts_density[[1]], xlim=xlim, ylim=ylim, type="n", 
+ylab="Smoothing density of log2-CPM", main="", cex.lab = 0.85)
+#plot each line
+for (i in 1:length(post_counts_density)) lines(post_counts_density[[i]], col=cols[i], lty=ltys[i])
+#create legend
+legend("topright", colnames(post_data2plot),  
+       col=cols, lty=ltys, cex=0.75, 
+       border ="blue",  text.col = "green4", 
+       merge = TRUE, bg = "gray90")
+```
+
+Notice no significance difference between pre and post normalization. I believe this is due to the fact that my original data happens to be close to a normal distribution, thus normalization with TMM method did not make any significant changes.
+
+# Missing Identifiers
+
+We will now deal with missing identifiers (missing HUGO gene symbols). First, we will check how many missing identifiers are present in our data right now.
+
+```{r}
+ensembl_id_missing_gene <- dataFilteredAnnot$ensembl_gene_id[which((dataFilteredAnnot$hgnc_symbol) == "")]
+length(ensembl_id_missing_gene)
+```
+We see that we have 732 missing identifiers, lets check out some of these rows with missing identifiers.
+```{r}
+kable(dataFilteredAnnot[which((dataFilteredAnnot$hgnc_symbol == ""))[1:5],1:8], type="html")
+```
+As the missing identifiers are only ~5% of the data set, we will keep these rows for now and continue with our analysis. Also, we have knowledge of the rows with missing identifiers which will allow us to remove/modify how we handle these missing identifiers easily later on in our analysis and removing these data at this step does not seem the best practice (would be interesting to see how these genes with missing identifiers result in our final analysis).
+
+# Final Data
+
+Now we present the final data set that has been filtered, normalized and mapped to HUGO gene symbols with 14683 genes (rows).
+```{r}
+head(dataFilteredAnnot)
+```
+
+```{r}
+dim(dataFilteredAnnot)
+```
+
+
+# Interpertation.
+
+### What are the control and test conditions of the dataset?
+The experiment consists of 3 replications of the non-targeting control condition and 3 replications of the test condition.
+The test conditions were generated by stably infecting VCaP cells with shRNA against NEDD9 (shNEDD9) versus the non-targeting control condition. 
+
+### Why is the dataset of interest to you?
+First, I was looking for a data set related to cancer as I currently work as a research student at the Ontario Institute for Cancer Research and cancer research is a field that I am most interested in. From there, I wanted to work with a cancer data set that I have never worked with and prostate cancer was the first thing that came up in my mind. Looking at the queried data in the data selection section, 'GSE164531' was a data set regarding prostate cancer with 3 replications of each condition which was exactly what I was looking for. Thus, I decided to choose the 'GSE164531' data set for the course.
+
+### Were there expression values that were not unique for specific genes? How did you handle these?
+2 expression values were not unique for specific genes as you see below (ENSG00000230417 and ENSG00000254876). I have kept them for now, however, I can always remove them if necessary as we have the data below. I decided to leave them because as long as we have the data, we can always adjust in the future if any problems arise and removing them at this early stage does not seem to be the safest thing to do. 
+```{r}
+n_occur <- data.frame(table(dataFilteredAnnot$ensembl_gene_id))
+n_occur[n_occur$Freq > 1, ]
+```
+
+### Were there expression values that could not be mapped to current HUGO symbols?
+Yes, there were expression values that could not be mapped to current HUGO symbols as mentioned in the 'Mising identifiers' section which accounted for ~5% of our filtered data set. As we have knowledge of the rows with missing identifiers which will allow us to remove/modify how we handle these missing identifiers easily later on  and removing these data at this step does not seem to be the best practice, I decided to keep these rows for now and continue with the analysis (would be interesting to see how these genes with missing identifiers result in our final analysis).
+
+### How many outliers were removed?
+44053 outliers were removed as discussed in the above section 'Filtering Data'. These outliers were identified by using the edgeR protocol by filtering low expression genes.
+
+### How did you handle replicates?
+The replications of this experiment consist of 3 biological replications of the test condition (shNEDD9) and the non-targeting control condition. I have grouped the replication into 2 categories in the 'Grouping Data' section (named after their test condition/control condition). None of them seem to be outleirs. As for gene duplicates, there were no duplication present in my data thus I did not have to handle these cases.
+
+### What is the final coverage of your dataset?
+The final coverage of my data set is 14684 expression values across 6 samples (3 replications each in each condition).
+
+
+
+
